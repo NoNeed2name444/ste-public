@@ -1,0 +1,131 @@
+name: macOS build
+run-name: macOS build ${{ inputs.transfer }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      transfer:
+        description: One-time upload identifier
+        required: true
+        type: string
+      signer:
+        description: Base64-encoded source signing public key
+        required: true
+        type: string
+      recipient:
+        description: Base64-encoded result encryption certificate
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    if: github.ref == 'refs/heads/main' && github.actor == github.repository_owner && github.triggering_actor == github.repository_owner
+    runs-on: macos-15
+    timeout-minutes: 35
+    env:
+      TRANSFER: ${{ inputs.transfer }}
+      SOURCE_SIGNER: ${{ inputs.signer }}
+      RESULT_RECIPIENT: ${{ inputs.recipient }}
+    steps:
+      - name: Prepare a one-time recipient
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$TRANSFER" =~ ^[a-f0-9]{32}$ ]]
+          [[ "$SOURCE_SIGNER" =~ ^[A-Za-z0-9+/=]+$ && "$RESULT_RECIPIENT" =~ ^[A-Za-z0-9+/=]+$ ]]
+          exchange="$RUNNER_TEMP/private-build"
+          mkdir -p "$exchange/public"
+          openssl_path="$(brew --prefix openssl@3)/bin/openssl"
+          if [[ ! -x "$openssl_path" ]]; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install openssl@3
+          fi
+          printf 'OPENSSL_PATH=%s\n' "$openssl_path" >> "$GITHUB_ENV"
+          printf '%s' "$SOURCE_SIGNER" | base64 -D > "$exchange/signer.pem"
+          printf '%s' "$RESULT_RECIPIENT" | base64 -D > "$exchange/result.pem"
+          "$openssl_path" pkey -pubin -in "$exchange/signer.pem" -noout
+          "$openssl_path" x509 -in "$exchange/result.pem" -noout
+          "$openssl_path" req -x509 -newkey rsa:3072 -nodes -days 1 -subj /CN=macOS-runner \
+            -keyout "$exchange/recipient.key" -out "$exchange/public/recipient.pem" > /dev/null 2>&1
+
+      - name: Share the public recipient certificate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: build-recipient
+          path: ${{ runner.temp }}/private-build/public/recipient.pem
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Receive and authenticate the encrypted input
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          exchange="$RUNNER_TEMP/private-build"
+          location="https://raw.githubusercontent.com/$GITHUB_REPOSITORY/build-input-$TRANSFER"
+          received=false
+          for (( attempt=0; attempt<150; attempt++ )); do
+            if curl -fsSL --max-time 30 "$location/input.sig" -o "$exchange/input.sig" 2>/dev/null &&
+               curl -fsSL --max-time 30 "$location/input.cms" -o "$exchange/input.cms" 2>/dev/null &&
+               "$OPENSSL_PATH" dgst -sha256 -verify "$exchange/signer.pem" -signature "$exchange/input.sig" \
+                 "$exchange/input.cms" > /dev/null 2>&1; then
+              received=true
+              break
+            fi
+            sleep 4
+          done
+          if [[ "$received" != true ]]; then
+            echo "No authenticated input arrived."
+            exit 1
+          fi
+          mkdir -m 700 "$exchange/source"
+          "$OPENSSL_PATH" cms -decrypt -binary -inform DER -in "$exchange/input.cms" \
+            -recip "$exchange/public/recipient.pem" -inkey "$exchange/recipient.key" \
+            -out "$exchange/input.tgz" > /dev/null 2>&1
+          tar -xzf "$exchange/input.tgz" -C "$exchange/source" > /dev/null 2>&1
+          rm -f "$exchange/recipient.key" "$exchange/input.tgz" "$exchange/input.cms" "$exchange/input.sig"
+
+      - name: Build and test on macOS
+        id: build
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          umask 077
+          exchange="$RUNNER_TEMP/private-build"
+          mkdir -m 700 "$exchange/output"
+          export BUILD_OUTPUT="$exchange/output"
+          export RUNNER_TEMP="$exchange"
+          cd "$exchange/source"
+          /bin/bash build.sh > "$exchange/build.log" 2>&1
+
+      - name: Encrypt the build and diagnostics
+        if: always() && steps.build.outcome != 'skipped'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          exchange="$RUNNER_TEMP/private-build"
+          cd "$exchange"
+          parts=(build.log output)
+          if [[ -d stethoscore-diagnostics ]]; then parts+=(stethoscore-diagnostics); fi
+          tar -czf - "${parts[@]}" | "$OPENSSL_PATH" cms -encrypt -binary -aes-256-gcm \
+            -outform DER -out encrypted-result.cms -recip result.pem \
+            -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256
+
+      - name: Upload encrypted output
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: encrypted-build
+          path: ${{ runner.temp }}/private-build/encrypted-result.cms
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+      - name: Report build failure
+        if: steps.build.outcome == 'failure'
+        run: exit 1
