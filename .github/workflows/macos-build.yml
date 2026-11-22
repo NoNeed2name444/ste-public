@@ -98,12 +98,51 @@ jobs:
           exchange="$RUNNER_TEMP/private-build"
           mkdir -m 700 "$exchange/output"
           export BUILD_OUTPUT="$exchange/output"
+          export BUILD_PROGRESS="$exchange/progress"
           export RUNNER_TEMP="$exchange"
           cd "$exchange/source"
-          /bin/bash build.sh > "$exchange/build.log" 2>&1
+          python3 - "$exchange" <<'PY'
+          import os
+          import signal
+          import subprocess
+          import sys
+          import time
+          from pathlib import Path
+
+          exchange = Path(sys.argv[1])
+          phases = {
+              "checks": "Running source checks.",
+              "simulator": "Building and running simulator tests.",
+              "complete": "Simulator capture complete.",
+          }
+          deadline = time.monotonic() + 16 * 60
+          previous = None
+          with (exchange / "build.log").open("wb") as log:
+              child = subprocess.Popen(["/bin/bash", "build.sh"], stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+              while child.poll() is None:
+                  progress = exchange / "progress"
+                  phase = progress.read_text().strip() if progress.exists() else None
+                  if phase in phases and phase != previous:
+                      print(phases[phase], flush=True)
+                      previous = phase
+                  if time.monotonic() >= deadline:
+                      os.killpg(child.pid, signal.SIGTERM)
+                      try:
+                          child.wait(timeout=15)
+                      except subprocess.TimeoutExpired:
+                          os.killpg(child.pid, signal.SIGKILL)
+                          child.wait()
+                      log.write(b"\nThe build reached its diagnostic timeout.\n")
+                      sys.exit(124)
+                  time.sleep(2)
+          sys.exit(child.returncode)
+          PY
 
       - name: Encrypt the build and diagnostics
         if: always() && steps.build.outcome != 'skipped'
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
         shell: bash
         run: |
           set -euo pipefail
@@ -111,7 +150,9 @@ jobs:
           exchange="$RUNNER_TEMP/private-build"
           cd "$exchange"
           parts=(build.log output)
-          if [[ -d stethoscore-diagnostics ]]; then parts+=(stethoscore-diagnostics); fi
+          if [[ "$BUILD_OUTCOME" != success && -d stethoscore-diagnostics ]]; then
+            parts+=(stethoscore-diagnostics)
+          fi
           tar -czf - "${parts[@]}" | "$OPENSSL_PATH" cms -encrypt -binary -aes-256-gcm \
             -outform DER -out encrypted-result.cms -recip result.pem \
             -keyopt rsa_padding_mode:oaep -keyopt rsa_oaep_md:sha256
